@@ -1,2 +1,4 @@
 plotly
 streamlit
+yfinance
+boto3
