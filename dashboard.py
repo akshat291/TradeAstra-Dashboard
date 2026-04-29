@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import boto3
 from dotenv import load_dotenv
 import os
+import datetime
 
 load_dotenv()
 
@@ -25,6 +26,8 @@ def fetch_json_from_s3(bucket_name, object_key):
         response = s3.get_object(Bucket=bucket_name, Key=object_key)
         file_content = response['Body'].read().decode('utf-8')
         return json.loads(file_content)
+    except s3.exceptions.NoSuchKey:
+        return None 
     except Exception as e:
         st.error(f"Failed to fetch data from S3. Error: {e}")
         st.stop()
@@ -32,7 +35,6 @@ def fetch_json_from_s3(bucket_name, object_key):
 # --- HELPER: LIVE PRICE FETCHER ---
 @st.cache_data(ttl=300)
 def get_live_price(ticker):
-    """Fetches the latest close price from Yahoo Finance."""
     try:
         yf_ticker = f"{ticker}.NS" 
         stock = yf.Ticker(yf_ticker)
@@ -46,7 +48,6 @@ def get_live_price(ticker):
 # --- HELPER: DAILY PRICE FETCHER FOR CHART ---
 @st.cache_data(ttl=300)
 def get_daily_prices(ticker, period="1mo"):
-    """Fetches daily historical price data."""
     try:
         yf_ticker = f"{ticker}.NS"
         stock = yf.Ticker(yf_ticker)
@@ -75,15 +76,16 @@ def load_data(json_data):
             "Ticker": ticker,
             "Entry": details.get("entry_price"),
             "Stop Loss": details.get("stop_loss"),
-            "Last_Close": details.get("last_close"), # <-- NEW: Extracting last close
+            "Last_Close": details.get("last_close"),
             "T1": targets.get("T1"),
             "T2": targets.get("T2"),
             "T3": targets.get("T3"),
             "T1_Date": hit_dates.get("T1"),
             "T2_Date": hit_dates.get("T2"),
             "T3_Date": hit_dates.get("T3"),
-            "Days": details.get("days_tracked", 0),
-            "Status": final_validation.get("status", "UNKNOWN"),
+            # SEPARATED THE TWO STATUSES HERE:
+            "Publish_Status": final_validation.get("status", "UNKNOWN"),
+            "Trade_Status": details.get("status", "UNKNOWN"),
             "Final_Score": details.get("final_score", 0.0),
             "Category": details.get("category", "UNKNOWN"),
             "Predicted_5d": details.get("predicted_5d", [])
@@ -92,25 +94,53 @@ def load_data(json_data):
     return pd.DataFrame(data)
 
 # ==========================================
+# DATE SELECTION LOGIC (Calendar UI)
+# ==========================================
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+current_date = datetime.datetime.now(IST).date()
+start_date = datetime.date(2026, 4, 24)
+
+default_date = current_date
+if default_date.weekday() == 5:  # Saturday
+    default_date -= datetime.timedelta(days=1)
+elif default_date.weekday() == 6:  # Sunday
+    default_date -= datetime.timedelta(days=2)
+
+st.sidebar.header("Select Trading Day")
+selected_date = st.sidebar.date_input(
+    "Choose a date to track:", 
+    value=default_date,
+    min_value=start_date,
+    max_value=current_date,
+    format="YYYY-MM-DD"
+)
+
+if selected_date.weekday() >= 5:
+    day_name = selected_date.strftime('%A')
+    st.sidebar.error(f"🛑 {day_name}s are not trading days. Please select a valid weekday.")
+    st.warning("The market is closed on weekends. No data is generated.")
+    st.stop()
+
+
+# ==========================================
 # MAIN APP EXECUTION
 # ==========================================
-
 BUCKET_NAME = "swapnil-miscellaneous"
-FILE_KEY = "target_tracker/target.json"
+FILE_KEY = f"target_tracker/year={selected_date.year}/month={selected_date.strftime('%m')}/day={selected_date.strftime('%d')}/target.json"
 
-with st.spinner("Fetching data from S3..."):
+with st.spinner(f"Fetching S3 data for {selected_date.strftime('%Y-%m-%d')}..."):
     parsed_json = fetch_json_from_s3(BUCKET_NAME, FILE_KEY)
     
 if parsed_json:
     raw_df = load_data(parsed_json)
 else:
-    st.warning("No data returned from S3.")
+    st.warning(f"No target tracking data found in S3 for {selected_date.strftime('%d %b %Y')}. It may not have been processed yet.")
     st.stop()
 
 
 # --- SIDEBAR: FILTERING LOGIC ---
-st.sidebar.header("🎯 Filter Settings")
-st.sidebar.markdown("Choose how target price information will be displayed:")
+st.sidebar.divider()
+st.sidebar.header("Filter Settings")
 
 filter_mode = st.sidebar.radio(
     "Select Display Mode:",
@@ -119,7 +149,8 @@ filter_mode = st.sidebar.radio(
 
 if filter_mode == "PUBLISH Status":
     st.sidebar.info("Currently showing stocks with status: PUBLISH")
-    df = raw_df[raw_df['Status'] == 'PUBLISH'].copy()
+    # Updated to filter by Publish_Status
+    df = raw_df[raw_df['Publish_Status'] == 'PUBLISH'].copy()
 
 elif filter_mode == "Final Score":
     max_items = len(raw_df)
@@ -134,11 +165,15 @@ elif filter_mode == "Final Score":
 
 elif filter_mode == "Category":
     available_categories = sorted(raw_df['Category'].dropna().unique().tolist())
+    category_counts = raw_df['Category'].value_counts().to_dict()
+    
     selected_categories = st.sidebar.multiselect(
         "Select Categories", 
         options=available_categories, 
-        default=available_categories 
+        default=available_categories,
+        format_func=lambda x: f"{x} ({category_counts.get(x, 0)})"
     )
+    
     df = raw_df[raw_df['Category'].isin(selected_categories)].copy()
 
 if df.empty:
@@ -164,13 +199,18 @@ st.divider()
 
 # --- 2. DROPDOWN & FILTER LOGIC ---
 st.markdown("### Stock Target Details")
-options = ["Show All (Target Met)"] + df["Ticker"].tolist()
+options = ["Show All (Target Met)", "Show All (DEAD)"] + df["Ticker"].tolist()
 selected_view = st.selectbox("View Specific Stock:", options)
 
 if selected_view == "Show All (Target Met)":
     display_df = df[df['T1_Date'].notna()].reset_index(drop=True)
     if display_df.empty:
         st.info("None of the filtered stocks have hit their T1 target yet.")
+elif selected_view == "Show All (DEAD)":
+    # Updated to correctly filter by Trade_Status
+    display_df = df[df['Trade_Status'] == 'DEAD'].reset_index(drop=True)
+    if display_df.empty:
+        st.info("None of the filtered stocks currently have a DEAD status.")
 else:
     display_df = df[df['Ticker'] == selected_view].reset_index(drop=True)
 
@@ -181,15 +221,15 @@ def format_target(val, date):
     return f"**Target:** {val_str}  |  **Hit On:** {date_str}"
 
 # --- 3. DISPLAY LOGIC ---
-if selected_view == "Show All (Target Met)" and not display_df.empty:
+if selected_view in ["Show All (Target Met)", "Show All (DEAD)"] and not display_df.empty:
     cols = st.columns(2)
     for index, row in display_df.iterrows():
         col_index = index % 2 
         with cols[col_index]:
             with st.container(border=True):
                 st.subheader(f"📈 {row['Ticker']}")
-                st.caption(f"**Score:** {row['Final_Score']} | **Category:** {row['Category']}")
-                st.markdown(f"**⏱️ Days Tracked:** {row['Days']}")
+                # Updated to show Trade_Status
+                st.caption(f"**Score:** {row['Final_Score']} | **Category:** {row['Category']} | **Trade Status:** {row['Trade_Status']}")
                 st.markdown(f"**T1** - {format_target(row['T1'], row['T1_Date'])}")
                 st.markdown(f"**T2** - {format_target(row['T2'], row['T2_Date'])}")
                 st.markdown(f"**T3** - {format_target(row['T3'], row['T3_Date'])}")
@@ -203,14 +243,13 @@ elif not display_df.empty:
     with col_info:
         with st.container(border=True):
             st.subheader(f"📈 {ticker}")
-            st.caption(f"**Score:** {row['Final_Score']} | **Category:** {row['Category']}")
-            st.markdown(f"**⏱️ Days Tracked:** {row['Days']}")
+            # Updated to show Trade_Status
+            st.caption(f"**Score:** {row['Final_Score']} | **Category:** {row['Category']} | **Trade Status:** {row['Trade_Status']}")
             st.markdown(f"**T1** - {format_target(row['T1'], row['T1_Date'])}")
             st.markdown(f"**T2** - {format_target(row['T2'], row['T2_Date'])}")
             st.markdown(f"**T3** - {format_target(row['T3'], row['T3_Date'])}")
             
     with col_chart:
-        # --- ORIGINAL ANATOMY CHART ---
         with st.spinner(f"Fetching live price for {ticker}..."):
             current_price = get_live_price(ticker)
         
@@ -255,7 +294,6 @@ elif not display_df.empty:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    # --- NEW: ACTUAL VS PREDICTED LINE CHART ---
     if row['Predicted_5d']:
         st.markdown("#### Actual vs Predicted Price (5-Day Horizon)")
         
@@ -274,7 +312,6 @@ elif not display_df.empty:
             
             filtered_hist = hist_df[(hist_df.index >= start_dt) & (hist_df.index <= end_dt)]
             
-            # Trace 1: Actual Daily Price
             if not filtered_hist.empty:
                 fig_line.add_trace(go.Scatter(
                     x=filtered_hist.index, 
@@ -285,7 +322,6 @@ elif not display_df.empty:
                     marker=dict(size=8, color='blue')
                 ))
             
-        # Trace 2: Predicted Daily Price
         fig_line.add_trace(go.Scatter(
             x=pred_dates, 
             y=pred_prices, 
@@ -295,7 +331,6 @@ elif not display_df.empty:
             marker=dict(size=8, symbol='diamond', color='orange')
         ))
 
-        # --- NEW: HORIZONTAL LINES FOR STOP LOSS AND LAST CLOSE ---
         if pd.notna(row["Stop Loss"]):
             fig_line.add_hline(
                 y=row["Stop Loss"], 
