@@ -83,12 +83,13 @@ def load_data(json_data):
             "T1_Date": hit_dates.get("T1"),
             "T2_Date": hit_dates.get("T2"),
             "T3_Date": hit_dates.get("T3"),
-            # SEPARATED THE TWO STATUSES HERE:
             "Publish_Status": final_validation.get("status", "UNKNOWN"),
             "Trade_Status": details.get("status", "UNKNOWN"),
             "Final_Score": details.get("final_score", 0.0),
             "Category": details.get("category", "UNKNOWN"),
-            "Predicted_5d": details.get("predicted_5d", [])
+            "Predicted_5d": details.get("predicted_5d", []),
+            "LSTM_Prediction": details.get("lstm_prediction", []), # ADDED LSTM
+            "XGBoost_Prediction": details.get("xgboost_prediction", []) # ADDED XGBOOST
         })
         
     return pd.DataFrame(data)
@@ -97,7 +98,7 @@ def load_data(json_data):
 # DATE SELECTION LOGIC (Calendar UI)
 # ==========================================
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-current_date = datetime.datetime.now(IST).date()
+current_date = datetime.datetime.now(IST).date() - datetime.timedelta(days=1)
 start_date = datetime.date(2026, 4, 24)
 
 default_date = current_date
@@ -149,7 +150,6 @@ filter_mode = st.sidebar.radio(
 
 if filter_mode == "PUBLISH Status":
     st.sidebar.info("Currently showing stocks with status: PUBLISH")
-    # Updated to filter by Publish_Status
     df = raw_df[raw_df['Publish_Status'] == 'PUBLISH'].copy()
 
 elif filter_mode == "Final Score":
@@ -207,7 +207,6 @@ if selected_view == "Show All (Target Met)":
     if display_df.empty:
         st.info("None of the filtered stocks have hit their T1 target yet.")
 elif selected_view == "Show All (DEAD)":
-    # Updated to correctly filter by Trade_Status
     display_df = df[df['Trade_Status'] == 'DEAD'].reset_index(drop=True)
     if display_df.empty:
         st.info("None of the filtered stocks currently have a DEAD status.")
@@ -228,7 +227,6 @@ if selected_view in ["Show All (Target Met)", "Show All (DEAD)"] and not display
         with cols[col_index]:
             with st.container(border=True):
                 st.subheader(f"📈 {row['Ticker']}")
-                # Updated to show Trade_Status
                 st.caption(f"**Score:** {row['Final_Score']} | **Category:** {row['Category']} | **Trade Status:** {row['Trade_Status']}")
                 st.markdown(f"**T1** - {format_target(row['T1'], row['T1_Date'])}")
                 st.markdown(f"**T2** - {format_target(row['T2'], row['T2_Date'])}")
@@ -243,7 +241,6 @@ elif not display_df.empty:
     with col_info:
         with st.container(border=True):
             st.subheader(f"📈 {ticker}")
-            # Updated to show Trade_Status
             st.caption(f"**Score:** {row['Final_Score']} | **Category:** {row['Category']} | **Trade Status:** {row['Trade_Status']}")
             st.markdown(f"**T1** - {format_target(row['T1'], row['T1_Date'])}")
             st.markdown(f"**T2** - {format_target(row['T2'], row['T2_Date'])}")
@@ -294,7 +291,7 @@ elif not display_df.empty:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    if row['Predicted_5d']:
+    if row['Predicted_5d'] or row.get('LSTM_Prediction') or row.get('XGBoost_Prediction'):
         st.markdown("#### Actual vs Predicted Price (5-Day Horizon)")
         
         pred_dates = [pd.to_datetime(item['date']) for item in row['Predicted_5d']]
@@ -305,6 +302,7 @@ elif not display_df.empty:
             
         fig_line = go.Figure()
 
+        # Actual Close Line
         if not hist_df.empty and len(pred_dates) > 0:
             hist_df.index = hist_df.index.tz_localize(None).normalize()
             start_dt = pred_dates[0]
@@ -322,14 +320,44 @@ elif not display_df.empty:
                     marker=dict(size=8, color='blue')
                 ))
             
-        fig_line.add_trace(go.Scatter(
-            x=pred_dates, 
-            y=pred_prices, 
-            mode='lines+markers', 
-            name='Predicted Price',
-            line=dict(color='orange', width=2, dash='dash'),
-            marker=dict(size=8, symbol='diamond', color='orange')
-        ))
+        # Base 5D Prediction Trace
+        if pred_dates:
+            fig_line.add_trace(go.Scatter(
+                x=pred_dates, 
+                y=pred_prices, 
+                mode='lines+markers', 
+                name='Predicted Price (Base)',
+                line=dict(color='orange', width=2, dash='dash'),
+                marker=dict(size=8, symbol='diamond', color='orange')
+            ))
+            
+        # NEW: LSTM Prediction Trace
+        if row.get('LSTM_Prediction'):
+            lstm_dates = [pd.to_datetime(item['date']) for item in row['LSTM_Prediction']]
+            lstm_prices = [item['price'] for item in row['LSTM_Prediction']]
+            
+            fig_line.add_trace(go.Scatter(
+                x=lstm_dates, 
+                y=lstm_prices, 
+                mode='lines+markers', 
+                name='LSTM Prediction',
+                line=dict(color='purple', width=2, dash='dot'),
+                marker=dict(size=8, symbol='square', color='purple')
+            ))
+            
+        # NEW: XGBoost Prediction Trace
+        if row.get('XGBoost_Prediction'):
+            xgb_dates = [pd.to_datetime(item['date']) for item in row['XGBoost_Prediction']]
+            xgb_prices = [item['price'] for item in row['XGBoost_Prediction']]
+            
+            fig_line.add_trace(go.Scatter(
+                x=xgb_dates, 
+                y=xgb_prices, 
+                mode='lines+markers', 
+                name='XGBoost Prediction',
+                line=dict(color='green', width=2, dash='dashdot'),
+                marker=dict(size=8, symbol='triangle-up', color='green')
+            ))
 
         if pd.notna(row["Stop Loss"]):
             fig_line.add_hline(
@@ -353,10 +381,18 @@ elif not display_df.empty:
                 annotation_font_color="gray"
             )
 
-        if len(pred_dates) > 0:
+        # Extend x-axis range dynamically based on whichever prediction sets are available
+        all_dates = []
+        if 'pred_dates' in locals() and pred_dates: all_dates.extend(pred_dates)
+        if row.get('LSTM_Prediction'): all_dates.extend(lstm_dates)
+        if row.get('XGBoost_Prediction'): all_dates.extend(xgb_dates)
+
+        if len(all_dates) > 0:
+            min_date = min(all_dates)
+            max_date = max(all_dates)
             padding = pd.Timedelta(hours=12)
             fig_line.update_xaxes(
-                range=[pred_dates[0] - padding, pred_dates[-1] + padding],
+                range=[min_date - padding, max_date + padding],
                 title="Date",
                 tickformat="%d %b"
             )
