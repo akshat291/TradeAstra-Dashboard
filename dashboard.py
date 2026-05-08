@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import os
 import datetime
 
+# Load environment variables for AWS
 load_dotenv()
 
 access_key = os.getenv('aws_access_key_id')
@@ -22,7 +23,12 @@ st.markdown("Track target achievements and visualize live price action against y
 @st.cache_data(ttl=600)
 def fetch_json_from_s3(bucket_name, object_key):
     try:
-        s3 = boto3.client('s3', region_name='us-east-1', aws_access_key_id=access_key, aws_secret_access_key=secret_access_key)
+        s3 = boto3.client(
+            's3', 
+            region_name='us-east-1', 
+            aws_access_key_id=access_key, 
+            aws_secret_access_key=secret_access_key
+        )
         response = s3.get_object(Bucket=bucket_name, Key=object_key)
         file_content = response['Body'].read().decode('utf-8')
         return json.loads(file_content)
@@ -42,7 +48,7 @@ def get_live_price(ticker):
         if not hist.empty:
             return round(hist['Close'].iloc[-1], 2)
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 # --- HELPER: DAILY PRICE FETCHER FOR CHART ---
@@ -53,7 +59,7 @@ def get_daily_prices(ticker, period="1mo"):
         stock = yf.Ticker(yf_ticker)
         hist = stock.history(period=period, interval="1d") 
         return hist
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
 # --- DATA LOADING & PROCESSING ---
@@ -72,6 +78,7 @@ def load_data(json_data):
         hit_dates = details.get("hit_dates") or {}
         final_validation = details.get("final_validation") or {}
         
+        # We ensure all keys exist so filters don't break even if analyst data is sparse
         data.append({
             "Ticker": ticker,
             "Entry": details.get("entry_price"),
@@ -83,19 +90,19 @@ def load_data(json_data):
             "T1_Date": hit_dates.get("T1"),
             "T2_Date": hit_dates.get("T2"),
             "T3_Date": hit_dates.get("T3"),
-            "Publish_Status": final_validation.get("status", "UNKNOWN"),
-            "Trade_Status": details.get("status", "UNKNOWN"),
+            "Publish_Status": final_validation.get("status", "PUBLISH"), # Default to PUBLISH for Analyst tips if not specified
+            "Trade_Status": details.get("status", "ACTIVE"),
             "Final_Score": details.get("final_score", 0.0),
-            "Category": details.get("category", "UNKNOWN"),
+            "Category": details.get("category", "Telegram Analyst"),
             "Predicted_5d": details.get("predicted_5d", []),
-            "LSTM_Prediction": details.get("lstm_prediction", []), # ADDED LSTM
-            "XGBoost_Prediction": details.get("xgboost_prediction", []) # ADDED XGBOOST
+            "LSTM_Prediction": details.get("lstm_prediction", []),
+            "XGBoost_Prediction": details.get("xgboost_prediction", [])
         })
         
     return pd.DataFrame(data)
 
 # ==========================================
-# DATE SELECTION LOGIC (Calendar UI)
+# SIDEBAR: DATE & SOURCE SELECTION
 # ==========================================
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 current_date = datetime.datetime.now(IST).date() - datetime.timedelta(days=1)
@@ -107,37 +114,49 @@ if default_date.weekday() == 5:  # Saturday
 elif default_date.weekday() == 6:  # Sunday
     default_date -= datetime.timedelta(days=2)
 
-st.sidebar.header("Select Trading Day")
+st.sidebar.header("Configuration")
 selected_date = st.sidebar.date_input(
-    "Choose a date to track:", 
+    "1. Select Trading Day:", 
     value=default_date,
     min_value=start_date,
     max_value=current_date,
     format="YYYY-MM-DD"
 )
 
+# --- THE TELEGRAM SOURCE TOGGLE ---
+data_source = st.sidebar.selectbox(
+    "2. Data Source:",
+    ["Automated System", "Telegram Tip (Analyst)"],
+    help="Switch between pipeline-generated predictions and Finance Analyst tips."
+)
+
 if selected_date.weekday() >= 5:
-    day_name = selected_date.strftime('%A')
-    st.sidebar.error(f"🛑 {day_name}s are not trading days. Please select a valid weekday.")
-    st.warning("The market is closed on weekends. No data is generated.")
+    st.sidebar.error(f"🛑 Market is closed on weekends.")
     st.stop()
 
-
 # ==========================================
-# MAIN APP EXECUTION
+# S3 DYNAMIC ROUTING
 # ==========================================
 BUCKET_NAME = "swapnil-miscellaneous"
-FILE_KEY = f"target_tracker/year={selected_date.year}/month={selected_date.strftime('%m')}/day={selected_date.strftime('%d')}/target.json"
+year_str = str(selected_date.year)
+month_str = selected_date.strftime('%m')
+day_str = selected_date.strftime('%d')
 
-with st.spinner(f"Fetching S3 data for {selected_date.strftime('%Y-%m-%d')}..."):
+if data_source == "Telegram Tip (Analyst)":
+    # Routing to analyst folder
+    FILE_KEY = f"telegram_tracker/year={year_str}/month={month_str}/day={day_str}/telegram_tip.json"
+else:
+    # Routing to system folder
+    FILE_KEY = f"target_tracker/year={year_str}/month={month_str}/day={day_str}/target.json"
+
+with st.spinner(f"Fetching {data_source} data for {selected_date}..."):
     parsed_json = fetch_json_from_s3(BUCKET_NAME, FILE_KEY)
     
 if parsed_json:
     raw_df = load_data(parsed_json)
 else:
-    st.warning(f"No target tracking data found in S3 for {selected_date.strftime('%d %b %Y')}. It may not have been processed yet.")
+    st.warning(f"No {data_source} data found in S3 for {selected_date.strftime('%d %b %Y')}.")
     st.stop()
-
 
 # --- SIDEBAR: FILTERING LOGIC ---
 st.sidebar.divider()
@@ -149,7 +168,7 @@ filter_mode = st.sidebar.radio(
 )
 
 if filter_mode == "PUBLISH Status":
-    st.sidebar.info("Currently showing stocks with status: PUBLISH")
+    st.sidebar.info("Showing stocks with status: PUBLISH")
     df = raw_df[raw_df['Publish_Status'] == 'PUBLISH'].copy()
 
 elif filter_mode == "Final Score":
@@ -173,7 +192,6 @@ elif filter_mode == "Category":
         default=available_categories,
         format_func=lambda x: f"{x} ({category_counts.get(x, 0)})"
     )
-    
     df = raw_df[raw_df['Category'].isin(selected_categories)].copy()
 
 if df.empty:
@@ -181,7 +199,7 @@ if df.empty:
     st.stop()
 
 # --- 1. KPI CARDS ---
-st.markdown("### Overall Target Performance")
+st.markdown(f"### {data_source} Performance Overview")
 
 total_stocks = len(df)
 t1_met = len(df[df['T1_Date'].notna()])
@@ -192,8 +210,8 @@ t3_met = len(df[df['T3_Date'].notna()])
 
 kpi1, kpi2, kpi3 = st.columns(3)
 kpi1.metric("T1 Targets Met", f"{t1_met} / {total_stocks}")
-kpi2.metric("T2 Targets Met (Where Applicable)", f"{t2_met} / {t2_eligible}" if t2_eligible > 0 else "0 / 0")
-kpi3.metric("T3 Targets Met (Where Applicable)", f"{t3_met} / {t3_eligible}" if t3_eligible > 0 else "0 / 0")
+kpi2.metric("T2 Targets Met", f"{t2_met} / {t2_eligible}" if t2_eligible > 0 else "0 / 0")
+kpi3.metric("T3 Targets Met", f"{t3_met} / {t3_eligible}" if t3_eligible > 0 else "0 / 0")
 
 st.divider()
 
@@ -205,11 +223,11 @@ selected_view = st.selectbox("View Specific Stock:", options)
 if selected_view == "Show All (Target Met)":
     display_df = df[df['T1_Date'].notna()].reset_index(drop=True)
     if display_df.empty:
-        st.info("None of the filtered stocks have hit their T1 target yet.")
+        st.info("No stocks have hit T1 yet.")
 elif selected_view == "Show All (DEAD)":
     display_df = df[df['Trade_Status'] == 'DEAD'].reset_index(drop=True)
     if display_df.empty:
-        st.info("None of the filtered stocks currently have a DEAD status.")
+        st.info("No stocks are currently in DEAD status.")
 else:
     display_df = df[df['Ticker'] == selected_view].reset_index(drop=True)
 
@@ -273,11 +291,11 @@ elif not display_df.empty:
                                      marker=dict(color='blue', size=18, symbol='circle'),
                                      name="Current (Live)", text=[f"Live<br>₹{current_price}"], textposition="top center"))
             
-        min_x = min([x for x in [row["Stop Loss"], row["Entry"]] if pd.notna(x)] or [0])
-        max_x = max([x for x in [row["T1"], row["T2"], row["T3"]] if pd.notna(x)] or [0])
+        min_vals = [x for x in [row["Stop Loss"], row["Entry"]] if pd.notna(x)]
+        max_vals = [x for x in [row["T1"], row["T2"], row["T3"], current_price] if pd.notna(x)]
         
-        if min_x != 0 and max_x != 0:
-            fig.add_shape(type="line", x0=min_x, y0=0, x1=max_x, y1=0, 
+        if min_vals and max_vals:
+            fig.add_shape(type="line", x0=min(min_vals), y0=0, x1=max(max_vals), y1=0, 
                           line=dict(color="lightgray", width=3, dash="dot"), layer="below")
 
         fig.update_layout(
@@ -291,118 +309,60 @@ elif not display_df.empty:
         )
         st.plotly_chart(fig, use_container_width=True)
 
+    # --- PREDICTION CHART SECTION ---
     if row['Predicted_5d'] or row.get('LSTM_Prediction') or row.get('XGBoost_Prediction'):
         st.markdown("#### Actual vs Predicted Price (5-Day Horizon)")
-        
-        pred_dates = [pd.to_datetime(item['date']) for item in row['Predicted_5d']]
-        pred_prices = [item['price'] for item in row['Predicted_5d']]
         
         with st.spinner("Fetching historical daily data..."):
             hist_df = get_daily_prices(ticker, period="1mo")
             
         fig_line = go.Figure()
 
-        # Actual Close Line
-        if not hist_df.empty and len(pred_dates) > 0:
+        # Actual Price Trace
+        if not hist_df.empty:
             hist_df.index = hist_df.index.tz_localize(None).normalize()
-            start_dt = pred_dates[0]
-            end_dt = pred_dates[-1]
-            
-            filtered_hist = hist_df[(hist_df.index >= start_dt) & (hist_df.index <= end_dt)]
-            
-            if not filtered_hist.empty:
-                fig_line.add_trace(go.Scatter(
-                    x=filtered_hist.index, 
-                    y=filtered_hist['Close'], 
-                    mode='lines+markers', 
-                    name='Actual Price (Daily Close)',
-                    line=dict(color='blue', width=2),
-                    marker=dict(size=8, color='blue')
-                ))
-            
-        # Base 5D Prediction Trace
-        if pred_dates:
             fig_line.add_trace(go.Scatter(
-                x=pred_dates, 
-                y=pred_prices, 
-                mode='lines+markers', 
-                name='Predicted Price (Base)',
-                line=dict(color='orange', width=2, dash='dash'),
-                marker=dict(size=8, symbol='diamond', color='orange')
+                x=hist_df.index, y=hist_df['Close'], 
+                mode='lines+markers', name='Actual Price',
+                line=dict(color='blue', width=2), marker=dict(size=6)
             ))
             
-        # NEW: LSTM Prediction Trace
+        # Base Prediction Trace
+        if row['Predicted_5d']:
+            p_dates = [pd.to_datetime(item['date']) for item in row['Predicted_5d']]
+            p_prices = [item['price'] for item in row['Predicted_5d']]
+            fig_line.add_trace(go.Scatter(
+                x=p_dates, y=p_prices, mode='lines+markers', name='Base Prediction',
+                line=dict(color='orange', width=2, dash='dash'), marker=dict(size=8, symbol='diamond')
+            ))
+            
+        # LSTM Trace
         if row.get('LSTM_Prediction'):
-            lstm_dates = [pd.to_datetime(item['date']) for item in row['LSTM_Prediction']]
-            lstm_prices = [item['price'] for item in row['LSTM_Prediction']]
-            
+            l_dates = [pd.to_datetime(item['date']) for item in row['LSTM_Prediction']]
+            l_prices = [item['price'] for item in row['LSTM_Prediction']]
             fig_line.add_trace(go.Scatter(
-                x=lstm_dates, 
-                y=lstm_prices, 
-                mode='lines+markers', 
-                name='LSTM Prediction',
-                line=dict(color='purple', width=2, dash='dot'),
-                marker=dict(size=8, symbol='square', color='purple')
+                x=l_dates, y=l_prices, mode='lines+markers', name='LSTM Prediction',
+                line=dict(color='purple', width=2, dash='dot'), marker=dict(size=8, symbol='square')
             ))
             
-        # NEW: XGBoost Prediction Trace
+        # XGBoost Trace
         if row.get('XGBoost_Prediction'):
-            xgb_dates = [pd.to_datetime(item['date']) for item in row['XGBoost_Prediction']]
-            xgb_prices = [item['price'] for item in row['XGBoost_Prediction']]
-            
+            x_dates = [pd.to_datetime(item['date']) for item in row['XGBoost_Prediction']]
+            x_prices = [item['price'] for item in row['XGBoost_Prediction']]
             fig_line.add_trace(go.Scatter(
-                x=xgb_dates, 
-                y=xgb_prices, 
-                mode='lines+markers', 
-                name='XGBoost Prediction',
-                line=dict(color='green', width=2, dash='dashdot'),
-                marker=dict(size=8, symbol='triangle-up', color='green')
+                x=x_dates, y=x_prices, mode='lines+markers', name='XGBoost Prediction',
+                line=dict(color='green', width=2, dash='dashdot'), marker=dict(size=8, symbol='triangle-up')
             ))
 
+        # SL Horizontal Line
         if pd.notna(row["Stop Loss"]):
-            fig_line.add_hline(
-                y=row["Stop Loss"], 
-                line_dash="dot", 
-                line_color="red", 
-                line_width=2,
-                annotation_text=f"Stop Loss (₹{row['Stop Loss']})", 
-                annotation_position="bottom right",
-                annotation_font_color="red"
-            )
-
-        if pd.notna(row["Last_Close"]):
-            fig_line.add_hline(
-                y=row["Last_Close"], 
-                line_dash="dot", 
-                line_color="gray", 
-                line_width=2,
-                annotation_text=f"Last Close (₹{row['Last_Close']})", 
-                annotation_position="top left",
-                annotation_font_color="gray"
-            )
-
-        # Extend x-axis range dynamically based on whichever prediction sets are available
-        all_dates = []
-        if 'pred_dates' in locals() and pred_dates: all_dates.extend(pred_dates)
-        if row.get('LSTM_Prediction'): all_dates.extend(lstm_dates)
-        if row.get('XGBoost_Prediction'): all_dates.extend(xgb_dates)
-
-        if len(all_dates) > 0:
-            min_date = min(all_dates)
-            max_date = max(all_dates)
-            padding = pd.Timedelta(hours=12)
-            fig_line.update_xaxes(
-                range=[min_date - padding, max_date + padding],
-                title="Date",
-                tickformat="%d %b"
-            )
+            fig_line.add_hline(y=row["Stop Loss"], line_dash="dot", line_color="red", 
+                               annotation_text="Stop Loss", annotation_position="bottom right")
 
         fig_line.update_layout(
-            yaxis_title="Price (₹)",
-            height=400,
+            yaxis_title="Price (₹)", height=400,
             margin=dict(l=20, r=20, t=20, b=20),
             hovermode="x unified",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        
         st.plotly_chart(fig_line, use_container_width=True)
